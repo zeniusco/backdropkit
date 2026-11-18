@@ -107,6 +107,7 @@ class CompositeEngine(context: Context) {
     private var wCam = 0
     private var wShown = 0
     private var wEnc = 0
+    private var wScreen = 0
     private var wFailScreen = 0
     private var wFailVideo = 0
     private var wErr = 0
@@ -140,12 +141,12 @@ class CompositeEngine(context: Context) {
             val n = wSegN.getAndSet(0)
             val sum = wSegSum.getAndSet(0)
             val mx = wSegMax.getAndSet(0)
-            val line = "gl in $wCam shown $wShown enc $wEnc | ms avg/max copy ${s(0)} prep ${s(1)} alpha ${s(2)} " +
+            val line = "gl in $wCam shown $wShown screen $wScreen enc $wEnc | ms avg/max copy ${s(0)} prep ${s(1)} alpha ${s(2)} " +
                 "screen ${s(3)} video ${s(4)} remote ${s(5)} | wait $wait | model n $n avg ${if (n > 0) sum / n else 0} max $mx | " +
                 "inflight ${inFlight.get()} reads ${reads.size} held ${ring.count { it.pending }} | " +
                 "swapfail $wFailScreen/$wFailVideo err $wErr | ${naturalWidth}x$naturalHeight mode $mode"
             java.util.Arrays.fill(stSum, 0); java.util.Arrays.fill(stMax, 0); java.util.Arrays.fill(stN, 0)
-            wCam = 0; wShown = 0; wEnc = 0; wFailScreen = 0; wFailVideo = 0; wErr = 0
+            wCam = 0; wShown = 0; wScreen = 0; wEnc = 0; wFailScreen = 0; wFailVideo = 0; wErr = 0
             cb(line)
         }
     }
@@ -1034,10 +1035,13 @@ class CompositeEngine(context: Context) {
 
     /** Shows (and records) every waiting frame up to [id], oldest first. */
     private fun presentPendingUpTo(id: Long) {
-        while (true) {
-            val next = ring.filter { it.pending && it.id <= id }.minByOrNull { it.id } ?: return
-            present(next)
-        }
+        // Frames often become ready two or three at once (one cut-out finishes and frames that
+        // waited for it go out together). The video gets every one of them, each with its own
+        // time stamp, so it plays smoothly. The screen cannot: it can only show one picture per
+        // refresh, so drawing all of them made it jump and stall while the drawing thread was
+        // kept busy with pictures nobody saw. Only the newest of such a group goes to the screen.
+        val due = ring.filter { it.pending && it.id <= id }.sortedBy { it.id }
+        for ((i, slot) in due.withIndex()) present(slot, toScreen = i == due.lastIndex)
     }
 
     // ---- speed readout (shown on screen when switched on)
@@ -1062,11 +1066,7 @@ class CompositeEngine(context: Context) {
         }
     }
 
-    /** While recording, draw only every n-th frame on the screen (1 = all). The video gets all. */
-    @Volatile var previewEveryNthWhileRecording = 1
-    private var previewCounter = 0L
-
-    private fun present(slot: Slot) {
+    private fun present(slot: Slot, toScreen: Boolean = true) {
         countPresented()
         slot.pending = false
         makeCurrentAny()
@@ -1079,11 +1079,10 @@ class CompositeEngine(context: Context) {
             maybeSnapshot(slot)
             stage(5, t)
         }
-        val recording = encoderSurface != EGL14.EGL_NO_SURFACE
-        val n = previewEveryNthWhileRecording
         t = SystemClock.uptimeMillis()
-        if (!recording || n <= 1 || ++previewCounter % n == 0L) {
+        if (toScreen) {
             showOnScreen(slot)
+            wScreen++
         } else if (mode == MODE_BLUR || (mode == MODE_IMAGE && !bgReady)) {
             updateBlurSource(slot) // the video's blurred background still needs this frame
         }
